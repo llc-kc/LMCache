@@ -194,12 +194,14 @@ __global__ void load_and_reshape_multi_layer_kernel(
   const int num_threads = blockDim.x;
 
   const int64_t slot_idx = slot_mapping[token_id];
-  int64_t* paged_buffer_ptr = paged_buffer_ptrs[layer_id];
+  scalar_t* paged_buffer_ptr = paged_buffer_ptrs[layer_id];
 
   if (slot_idx < 0) {
     return;
   }
-
+  if (slot_idx >= page_buffer_size) {
+    return;
+  }
   /** Copy the data from page buffer to key_value **/
   for (int i = tid; i < scalars_per_token; i += num_threads) {
     const int64_t lmcache_offset =
@@ -236,13 +238,15 @@ __global__ void load_and_reshape_multi_layer_kernel_unilateral(
   const int num_threads = blockDim.x;
 
   const int64_t slot_idx = slot_mapping[token_id];
-  int64_t* key_ptr = paged_buffer_ptrs[layer_id];
-  int64_t* value_ptr = paged_buffer_ptrs[layer_id + num_layers];
+  scalar_t* key_ptr = paged_buffer_ptrs[layer_id];
+  scalar_t* value_ptr = paged_buffer_ptrs[layer_id + num_layers];
 
   if (slot_idx < 0) {
     return;
   }
-
+  if (slot_idx >= page_buffer_size) {
+    return;
+  }
   /** Copy the data from page buffer to key_value **/
   for (int i = tid; i < scalars_per_token; i += num_threads) {
     const int64_t lmcache_offset =
@@ -324,16 +328,17 @@ void multi_layer_kv_transfer(
     const torch::Tensor& slot_mapping,    // [num_tokens],
     const torch::Device& paged_memory_device, const int page_buffer_size,
     const bool direction, const bool use_mla) {
-  int64_t* key_value_ptr = get_kernel_ptr<int64_t, torch::Tensor>(key_value);
-  int64_t** page_buffer_ptrs =
-      get_kernel_ptr<int64_t*, const torch::Tensor>(key_value_ptrs);
+  using scalar_t = int32_t;
+  scalar_t* key_value_ptr = get_kernel_ptr<scalar_t, torch::Tensor>(key_value);
+  scalar_t** page_buffer_ptrs =
+      get_kernel_ptr<scalar_t*, const torch::Tensor>(key_value_ptrs);
   const int64_t* slot_mapping_ptr =
       get_kernel_ptr<const int64_t, const torch::Tensor>(slot_mapping);
 
   int num_layers = key_value.size(1);
   int num_tokens = slot_mapping.size(0);
   int num_origin_elements = key_value.size(3);
-  int elements_per_qword = 8 / key_value.element_size();
+  int elements_per_qword = sizeof(scalar_t) / key_value.element_size();
   int num_qwords = num_origin_elements / elements_per_qword;
 
   int k_or_v_size = 2;
@@ -341,20 +346,22 @@ void multi_layer_kv_transfer(
     k_or_v_size = 1;
   }
 
-  dim3 grid(key_value.size(2), num_layers, k_or_v_size);
-  dim3 block(std::min(num_qwords, 128));
+  dim3 grid(key_value.size(2), key_value.size(1), k_or_v_size);
+  int block = num_qwords / 32 * 32;
+  block = std::min(block, 320);
+  block = std::max(block, 32);
 
   const at::cuda::OptionalCUDAGuard device_guard(paged_memory_device);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (not direction) {
-    lmc::load_and_reshape_multi_layer_kernel<int64_t, false>
+    lmc::load_and_reshape_multi_layer_kernel<scalar_t, false>
         <<<grid, block, 0, stream>>>(key_value_ptr, page_buffer_ptrs,
                                      slot_mapping_ptr, num_qwords, num_tokens,
                                      num_layers, page_buffer_size);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
-    lmc::load_and_reshape_multi_layer_kernel<int64_t, true>
+    lmc::load_and_reshape_multi_layer_kernel<scalar_t, true>
         <<<grid, block, 0, stream>>>(key_value_ptr, page_buffer_ptrs,
                                      slot_mapping_ptr, num_qwords, num_tokens,
                                      num_layers, page_buffer_size);
@@ -402,35 +409,37 @@ void multi_layer_kv_transfer_unilateral(
                                    paged_memory_device, page_buffer_size,
                                    direction, use_mla);
   }
-
-  int64_t* key_value_ptr = get_kernel_ptr<int64_t, torch::Tensor>(key_value);
-  int64_t** page_buffer_ptrs =
-      get_kernel_ptr<int64_t*, const torch::Tensor>(key_value_ptrs);
+  using scalar_t = int32_t;
+  scalar_t* key_value_ptr = get_kernel_ptr<scalar_t, torch::Tensor>(key_value);
+  scalar_t** page_buffer_ptrs =
+      get_kernel_ptr<scalar_t*, const torch::Tensor>(key_value_ptrs);
   const int64_t* slot_mapping_ptr =
       get_kernel_ptr<const int64_t, const torch::Tensor>(slot_mapping);
 
   int num_layers = key_value.size(1);
   int num_tokens = slot_mapping.size(0);
   int num_origin_elements = key_value.size(3);
-  int elements_per_qword = 8 / key_value.element_size();
+  int elements_per_qword = sizeof(scalar_t) / key_value.element_size();
   int num_qwords = num_origin_elements / elements_per_qword;
 
   int k_or_v_size = 2;
 
   dim3 grid(key_value.size(2), key_value.size(1), k_or_v_size);
-  dim3 block(std::min(num_qwords, 128));
+  int block = num_qwords / 32 * 32;
+  block = std::min(block, 320);
+  block = std::max(block, 32);
 
   const at::cuda::OptionalCUDAGuard device_guard(paged_memory_device);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (not direction) {
-    lmc::load_and_reshape_multi_layer_kernel_unilateral<int64_t, false>
+    lmc::load_and_reshape_multi_layer_kernel_unilateral<scalar_t, false>
         <<<grid, block, 0, stream>>>(key_value_ptr, page_buffer_ptrs,
                                      slot_mapping_ptr, num_qwords, num_tokens,
                                      num_layers, page_buffer_size);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
-    lmc::load_and_reshape_multi_layer_kernel_unilateral<int64_t, true>
+    lmc::load_and_reshape_multi_layer_kernel_unilateral<scalar_t, true>
         <<<grid, block, 0, stream>>>(key_value_ptr, page_buffer_ptrs,
                                      slot_mapping_ptr, num_qwords, num_tokens,
                                      num_layers, page_buffer_size);
